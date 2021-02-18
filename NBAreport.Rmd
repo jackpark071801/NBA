@@ -1,0 +1,478 @@
+---
+title: "NBA Players Data Report"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("/Users/jackpark/Documents/Fun_Programs/Basketball Player Evaluation")
+```
+
+
+The first step in this data report is to download the data that will be analyzed. For this I have taken data from all NBA games from October 22nd 2019 to February 12th 2021. This data can be downloaded [here](https://www.advancedsportsanalytics.com/nba-raw-data)
+
+```{r}
+rawdata <- read.csv("ASA All NBA Raw Data.csv")
+summary(rawdata)
+```
+
+There are a lot of variates in this data, but I don't think that we will be needing all of them. The first step is to think about what the goal of this report is and from there I can find out what variates I will and will not need. I want to find a way with this data to estimate a player's value offensively and defensively relative to their position. I also want to show at what point (in terms of games/minutes played) one would be able to conclude that Player A is better than Player B if I use my calculated offensive and defensive metrics.
+
+The first thing to note is that this data includes a variate "plus_minus" which is equivalent to: $Number Of Points Scored By Team While Player Is On The Court - Number Of Points Scored Against Team While Player Is On The Court$. This variate is a nice way of summarizing a player's value because to win a game of basketball you need to score more than the opposing team and this allows me to condense my player evaluation into one stat instead of multiple. So in my models I will be using "plus_minus" as my response variate. But, I do not want the response variate to be influenced by minutes played by a player so I will divide "plus_minus" by "minutes" to get my response variate and I will do the same thing with my explanatory variates as well to account for these differences in play time.
+
+Another thing to note with the model is that many of the explanatory variates' coefficients will be further influenced by the position that a player is playing. For example, getting a rebound as a point guard might not be as critical to winning as getting a rebound as a center. To combat this I'm going to start by adding a factor variate that has the most played position by a player in the given game. This will allow me to model based on a player's position as well:
+
+```{r}
+playeddata <- subset(rawdata, minutes > 0) #subsetting for only players that played that game
+playeddata <- subset(playeddata, !is.na(PG.)) #getting rid of rows with missing data
+playeddata$Pos <- "" #initializing the Pos variable
+positions <- c("PG", "SG", "SF", "PF", "C") #all possible values for Pos
+for (i in 1:nrow(playeddata)) { #iterate through every row of playeddata
+  playeddata$Pos[i] <- positions[which.max(playeddata[i, c("PG.", "SG.", "SF.", "PF.", "C.")])]
+  #the column that has the largest value in it will be returned and then that position
+  #will be assigned to Pos[i]. Note that if two positions are tied it will pick the
+  #first value, so if PG. = 0.5 and SG. = 0.5, playeddata$Pos[i] = "PG"
+}
+playeddata$Pos <- as.factor(playeddata$Pos) #change from character to factor variate
+head(playeddata$Pos) #display first 6 values
+```
+
+The next step is to find the response variates. Now I could just use my knowledge of basketball and pick a few of the variates in the data that I feel would make sense to be related to how good or bad a player is. Instead of that, I'm going to plot several variates against "plus_minus" and visually analyze whether or not they seem to have a relationship of any sort, whether that be linear, quadratic or something else. Before doing that I need to pick the variates I'm going to plot as well as modify them because I need them all to be relative to minutes played. I'm going to make a function that can do this for a given position, let's start by looking at how these variates compare to "plus_minus" for Point Guards:
+
+```{r}
+variatePlot <- function(position) {
+  posdata <- subset(playeddata, Pos == position) #position only
+  posdata <- subset(posdata, minutes > 30) #players who played a significant amount of
+  #minutes that game only
+  plus_minus_pm <- with(posdata, plus_minus / minutes) #plus_minus per minute
+  ts_pm <- with(posdata, ts_pct * (fga + fta) / minutes) #true shooting% is in relation
+  #to how many shots a player has taken so I have to multiply it by the Field Goal Attempts
+  #and Free Throw Attempts and then Minutes Played. This stat aims to adjust Field Goal% by
+  #adding extra value to 3 pointers and also accounts for free throws
+  orb_pm <- with(posdata, orb / minutes) #offensive rebounds per minute
+  drb_pm <- with(posdata, drb/ minutes) #defensive rebounds per minute
+  ast_pm <- with(posdata, ast / minutes) #assists per minute
+  stl_pm <- with(posdata, stl / minutes) #steals per minute
+  blk_pm <- with(posdata, blk / minutes) #blocks per minute
+  tov_pm <- with(posdata, tov / minutes) #turnovers per minute
+  usg_pct <- posdata$usg_pct #usage percent which is already not influenced by minutes played
+  
+  #Now that there are 8 variates lets plot them!
+  
+  par(mfrow = c(2,4)) #setting up the plots to show 8 at a time
+  varNames <- c("True Shooting/m", "Offensive Rebounds/m", "Defensive Rebounds/m",
+                "Assists/m", "Steals/m", "Blocks/m", "Turnovers/m", "Usage%")
+  vars <- data.frame(ts_pm, orb_pm, drb_pm, ast_pm, stl_pm, blk_pm, tov_pm, usg_pct)
+  for (i in 1:8) {
+    plot(vars[,i], plus_minus_pm, pch = 16, col = adjustcolor(col = "grey", alpha = 0.3),
+         xlab = varNames[i], ylab = "+/- per minute",
+         main = varNames[i])
+  }
+}
+
+variatePlot("PG")
+```
+
+From these plots there is evidence, albeit not a significant amount, that there is a relationship between +/- and the variates: True Shooting, Defensive Rebounds, Assists, Steals and Turnovers. While the variates: Offensive Rebounds, Blocks and Usage% don't seem to have a relationship. However, it doesn't seem to be very obvious how to characterize these relationships and it seems as though there'd be a lot of error in the model because most of these plots have a lot of variance in the +/- for the same response variate value. I believe that a large reason for this variance is that the data used is individual game data from a player instead of a player's averages over the time frame for example. So, I'm going to create a function that is very similar to variatePlot, but this function will use a player's averages over the course of the games they've played in the available data.
+
+```{r}
+library(plyr)
+variatePlot2 <- function(position) {
+  posdata <- subset(playeddata, Pos == position) #position only
+  posdata <- ddply(posdata, .(player, player_id), summarise,
+                   plus_minus = sum(plus_minus), minutes = sum(minutes),
+                   ts = sum(ts), orb = sum(orb), drb = sum(drb),
+                   ast = sum(ast), stl = sum(stl), blk = sum(blk),
+                   tov = sum(tov), usg = sum(usg_pct))
+  #compiling player totals in the position
+  plus_minus_pm <- with(posdata, plus_minus / minutes) #plus_minus per minute
+  ts_pm <- with(posdata, ts / minutes) #true shooting per minute
+  orb_pm <- with(posdata, orb / minutes) #offensive rebounds per minute
+  drb_pm <- with(posdata, drb/ minutes) #defensive rebounds per minute
+  ast_pm <- with(posdata, ast / minutes) #assists per minute
+  stl_pm <- with(posdata, stl / minutes) #steals per minute
+  blk_pm <- with(posdata, blk / minutes) #blocks per minute
+  tov_pm <- with(posdata, tov / minutes) #turnovers per minute
+  usg_pm <- with(posdata, usg / minutes) #usage per minute
+  
+  #Now that there are 8 variates lets plot them!
+  
+  par(mfrow = c(2,4)) #setting up the plots to show 8 at a time
+  varNames <- c("True Shooting/m", "Offensive Rebounds/m", "Defensive Rebounds/m",
+                "Assists/m", "Steals/m", "Blocks/m", "Turnovers/m", "Usage/m")
+  vars <- data.frame(ts_pm, orb_pm, drb_pm, ast_pm, stl_pm, blk_pm, tov_pm, usg_pm)
+  for (i in 1:8) {
+    plot(vars[,i], plus_minus_pm, pch = 16, col = adjustcolor(col = "grey", alpha = 0.3),
+         xlab = varNames[i], ylab = "+/- per minute",
+         main = varNames[i])
+  }
+}
+
+variatePlot2("PG")
+```
+
+Using the results from these plots, I'm going to narrow down the variates that will be used for each position. I'll do this by looking for the variates that seem to have a relationship with +/-. I will also keep note of whether or not the correlation seems to be positive or negative. In the case of a positive correlation, when the variate increases one would expect the +/- to increase as well and the opposite is true for negative correlation, when the variate increases I expect the +/- to decrease. This will be useful when evaluating if the model that I come up with makes sense. For point guards, it seems like the variates that have a relationship are: True Shooting/m, Defensive Rebounds/m, Assists/m, Steals/m and Turnovers/m with all of them having seemingly positive correlations aside from Turnovers/m which makes sense as I wouldn't expect turnovers to be an indicator of good play.
+
+```{r}
+variatePlot2("SG")
+```
+
+For shooting guards the variates are: True Shooting/m, Defensive Rebounds/m, Assists/m, Steals/m, Blocks/m, Turnovers/m and Usage/m. With all of them having positive correlation except for turnovers again and usage which I guess implies that it's better for a shooting guard to be a catch and shoot type of player with good defense than a second point guard.
+
+```{r}
+variatePlot2("SF")
+```
+
+For small forwards the variates are: True Shooting/m, Offensive Rebounds/m, Defensive Rebounds/m, Assists/m and Steals/m. With all of them having positive correlation, the lack of turnovers and usage being present here implies that a small forward's ability to handle the ball and run the court isn't that important which makes sense since they aren't usually in that role and it seems to improve the team's performance when they aren't in that role.
+
+
+```{r}
+variatePlot2("PF")
+```
+
+For power forwards the variates are: True Shooting/m, Offensive Rebounds/m, Defensive Rebounds/m and Blocks/m. With all of them having positive correlation, once again I am seeing a lack of ball movement skills being necessary for the role and even the type of defense at the position has changed from others as steals are no longer correlated. This makes sense as big men don't typically get a lot of steals because most of their defense is played in the post, so I'd expect to see a similar trend for centers.
+
+```{r}
+variatePlot2("C")
+```
+
+For centers the variates are: True Shooting/m, Offensive Rebounds/m, Defensive Rebounds/m, Assists/m, Blocks/m and Usage/m. With all of them having positive correlation, the trend expected from power forwards didn't quite materialize as expected since assists seem to be an important part of a center's skill set. This could be explained by the progressive increase in 3pt shooting in the league where centers who are good passers can find open shooters beyond the arc, as well as the emerging success of Nikola Jokic that has probably made coaches try to get their centers to play more like him as he's pretty much a point guard in a center's body.
+
+Now that all of the explanatory variates have been selected, I can begin to look into making my model. However, before that because I want to use the data where each player has individual games and that I will be using rates for my variates that are per minute. I have to make sure that all of my explanatory variates have a linear relationship with minutes played and if that isn't the case I will have to only take a subset of my data.
+
+```{r}
+mins <- playeddata$minutes
+ts <- playeddata$ts
+orb <- playeddata$orb
+drb <- playeddata$drb
+ast <- playeddata$ast
+stl <- playeddata$stl
+blk <- playeddata$blk
+tov <- playeddata$tov
+usg_pct <- playeddata$usg_pct
+par(mfrow = c(2,4)) #setting up the plots to show 8 at a time
+  varNames <- c("True Shooting", "Offensive Rebounds", "Defensive Rebounds",
+                "Assists", "Steals", "Blocks", "Turnovers", "Usage%")
+  vars <- data.frame(ts, orb, drb, ast, stl, blk, tov, usg_pct)
+  for (i in 1:8) {
+    plot(mins, vars[,i], pch = 16, col = adjustcolor(col = "grey", alpha = 0.1),
+         xlab = varNames[i], ylab = "Minutes",
+         main = varNames[i])
+  }
+```
+
+All of these seem to be linear except for Usage, which is expected as this is a percentage and not a raw number and so it will not naturally increase as the game goes on. But even from the usage plot, I can see that after roughly 10-15 minutes it starts to become linear. To be safe I'll set the minimum amount of minutes required for a player to be in the model to 15 minutes played.
+
+Now for the fun part, the model itself. I could simply use multiple linear regression, but that might not be the best idea for this specific case. This is because I'm using individual game data for each of my data points in the model and there are a lot of outlier games in the NBA where a player might not miss a single shot in a game or get 400% more blocks then usual. To combat this, I'm going to use the MASS package's rlm function which will weight different data based on if they are outliers or not. For comparison sake and illustration purposes, I will show how simply doing multiple linear regression differs from using robust regression.
+
+```{r}
+library(MASS)
+modelCreator <- function(position, variates) {
+  min15data <- subset(playeddata, minutes > 15) #subsetting for only players who
+                                                #played more than 15 minutes
+                                                #that game
+  posdata <- subset(min15data, Pos == position) #position only
+  posdata$plus_minus_pm <- with(posdata, plus_minus / minutes) #plus_minus per
+                                                               #minute
+  posdata$ts_pm <- with(posdata, ts / minutes) #true shooting per minute
+  posdata$orb_pm <- with(posdata, orb / minutes) #offensive rebounds per minute
+  posdata$drb_pm <- with(posdata, drb/ minutes) #defensive rebounds per minute
+  posdata$ast_pm <- with(posdata, ast / minutes) #assists per minute
+  posdata$stl_pm <- with(posdata, stl / minutes) #steals per minute
+  posdata$blk_pm <- with(posdata, blk / minutes) #blocks per minute
+  posdata$tov_pm <- with(posdata, tov / minutes) #turnovers per minute
+  
+  f <- as.formula(paste("plus_minus_pm", paste(variates, collapse = " + "),
+                  sep = " ~ ")) #this is the formula that the models will be fit
+                                #according to
+  multipleModel <- lm(f, data = posdata) #the multiple regression model
+  print(summary(multipleModel))
+  robustModel <- rlm(f, data = posdata, psi = "psi.bisquare")
+  print(summary(robustModel))
+}
+```
+
+Now to apply this model creating function to all five positions with the variates decided upon for each position:
+
+```{r}
+#The chosen variables for each position:
+PGvars <- list("ts_pm", "drb_pm", "ast_pm", "stl_pm", "tov_pm")
+SGvars <- list("ts_pm", "drb_pm", "ast_pm", "stl_pm", "blk_pm", "tov_pm", "usg_pct")
+SFvars <- list("ts_pm", "orb_pm", "drb_pm", "ast_pm", "stl_pm")
+PFvars <- list("ts_pm", "orb_pm", "drb_pm", "blk_pm")
+Cvars <- list("ts_pm", "orb_pm", "drb_pm", "ast_pm", "blk_pm", "usg_pct")
+posVars <- list(PGvars, SGvars, SFvars, PFvars, Cvars)
+positions <- c("PG", "SG", "SF", "PF", "C") #list of positions
+for (i in 1:5) {
+  cat("Models for ", positions[i], "\n\n")
+  pos.list <- rep("", length(posVars[[i]])) #create a blank list of the length
+                                            #of the number of variates for that
+                                            #position
+  for (j in 1:length(posVars[[i]])) {
+    pos.list[j] <- posVars[[i]][j]
+  }
+  modelCreator(positions[i], pos.list)
+  cat("\n\n")
+}
+```
+
+The first thing to check before moving on from these models is that the estimated values make sense. Now it might not be very clear what making sense means, but essentially I want to make sure that the variates that in my opinion should be positively contributing to a player's +/- are actually given positive estimates in the models. If there are examples where that isn't the case that may be due to the variate not having a relationship with +/- or it could be due to an accounted for trend with the NBA that I will have to find a way to account for. One example of one of these trends from the MLB is that if one were to make a model to predict Home Runs and included a response variate related to a player's speed then they might find that being fast is bad for hitting home runs. While that is technically the case with the data, it isn't actually a negative thing to be fast it's just that many baseball players have very different builds: some are large and hit a lot of home runs and some are more thin and very fast. If I didn't account for this in my model then players who are fast would be punished even though being fast and able to hit home runs are not mutually exclusive.
+
+So, the next step is to find if there are any variates that should be removed from any of the models for the different positions. The I will do this is if the t value beside the variable, if the absolute value of the t-value of for that variable is less than 1.960483 then it falls under the null hypothesis $H_0: variate = 0$ where there is no relationship. The value of 1.960483 is calculated assuming that the significance level is $\alpha = 0.05$ and that the t distribution has degrees of freedom equivalent to that of the position with the fewest qualifying games (Center). Even though this isn't technically fair to use for the other positions which have differing degrees of freedom due to the degrees of freedom being so high it won't make a significant difference in the final obtained value. The value is calculated by the following R code:
+
+```{r}
+alpha = 0.05 #significance level
+df = 4572 #degrees of freedom of Centers data
+tval <- qt(1 - alpha/2, df)
+print(tval)
+
+t.values <- seq(-4,4,.1)
+plot(x = t.values, y = dt(t.values, df), type = "l", ylim = c(0,.4),
+     xlab = "t values", ylab = "f(t)", main = "t distribution with df = 4572")
+abline(v = -tval, lty = 2, col = "blue")
+abline(v = tval, lty = 2, col = "blue")
+```
+
+Now to find remove all explanatory variates from the models where $|t_value| < 1.960483$; for the point guards, I remove only True shooting, for the shooting guards, the variates True Shooting and Usage% are removed, True Shooting is once again removed for small forwards and for power forwards and centers the only variates removed are Offensive Rebounds. Removing those variates and rerunning the model I get the following:
+
+```{r}
+#The adjusted variables for each position:
+PGvars <- list("drb_pm", "ast_pm", "stl_pm", "tov_pm")
+SGvars <- list("drb_pm", "ast_pm", "stl_pm", "blk_pm", "tov_pm")
+SFvars <- list("orb_pm", "drb_pm", "ast_pm", "stl_pm")
+PFvars <- list("ts_pm", "drb_pm", "blk_pm")
+Cvars <- list("ts_pm", "drb_pm", "ast_pm", "blk_pm", "usg_pct")
+posVars <- list(PGvars, SGvars, SFvars, PFvars, Cvars)
+positions <- c("PG", "SG", "SF", "PF", "C") #list of positions
+for (i in 1:5) {
+  cat("Models for ", positions[i], "\n\n")
+  pos.list <- rep("", length(posVars[[i]])) #create a blank list of the length
+                                            #of the number of variates for that
+                                            #position
+  for (j in 1:length(posVars[[i]])) {
+    pos.list[j] <- posVars[[i]][j]
+  }
+  modelCreator(positions[i], pos.list)
+  cat("\n\n")
+}
+```
+
+Now for the final part of the process of creating the model, making sure that the estimates "make sense." As I explained earlier there is no objective way to do this and I don't want my own biases to affect things too much but I believe that all of the variates except for Turnovers and Usage% should have positive estimates with Usage% having the possibility of being either, so if I find an exception in any of these variates then I will once again remove that variate from the model. Looking at the estimates, the only case where the estimate doesn't follow the rule set up above is for the small forwards model which has a negative estimate for Offensive Rebounds. The interesting and comforting finding to note is that the t value for this variate is very close to the boundary set from the previous step, so it is more likely that this estimate isn't reliable because the t value is so close to the cutoff point.
+
+Finally, removing that on variate for small forwards, the small forward model is:
+
+```{r}
+#The final variables for each small forwards:
+SFvars <- list("drb_pm", "ast_pm", "stl_pm")
+posVars <- list(PGvars, SGvars, SFvars, PFvars, Cvars)
+cat("Models for SF \n\n")
+modelCreator("SF", SFvars)
+cat("\n\n")
+```
+
+Now that the estimates are finalized, I can create estimated plus/minus values for my data, separating by position:
+
+```{r}
+#mPM will be the new variable name for the predicted plus/minus values using
+#multiple linear regression and rPM for robust regression
+
+xPM <- function(position) {
+  tempdata <- subset(playeddata, Pos == position)
+  tempdata$ts_pm <- with(tempdata, ts / minutes) #true shooting per minute
+  tempdata$orb_pm <- with(tempdata, orb / minutes) #offensive rebounds per minute
+  tempdata$drb_pm <- with(tempdata, drb/ minutes) #defensive rebounds per minute
+  tempdata$ast_pm <- with(tempdata, ast / minutes) #assists per minute
+  tempdata$stl_pm <- with(tempdata, stl / minutes) #steals per minute
+  tempdata$blk_pm <- with(tempdata, blk / minutes) #blocks per minute
+  tempdata$tov_pm <- with(tempdata, tov / minutes) #turnovers per minute
+  tempdata$plus_minus_pm <- with(tempdata, plus_minus / minutes) #+/- per minute
+  if (position == "PG") {
+    tempdata$mPM <- with(tempdata, -0.19200 + 0.89264*drb_pm
+                         + 1.01153*ast_pm + 1.15948*stl_pm
+                         - 1.38420*tov_pm)
+    tempdata$rPM <- with(tempdata, -0.1812 + 0.8938*drb_pm
+                         + 0.9849*ast_pm + 1.0234*stl_pm
+                         - 1.3805*tov_pm)
+    assign(paste(position, "Data", sep = ""), tempdata[,c("player", "player_id",
+                                                          "minutes", "plus_minus_pm",
+                                                          "drb_pm", "ast_pm",
+                                                          "stl_pm", "tov_pm",
+                                                          "mPM", "rPM")],
+           envir = .GlobalEnv)
+    #Use only the variates that are used in the model or to identify a player
+  }
+  if (position == "SG") {
+    tempdata$mPM <- with(tempdata, -0.19053 + 0.98377*drb_pm
+                         + 0.82076*ast_pm + 1.25597*stl_pm
+                         + 0.84090*blk_pm - 0.93002*tov_pm)
+    tempdata$rPM <- with(tempdata, -0.1806 + 0.9278*drb_pm
+                         + 0.7707*ast_pm + 1.2025*stl_pm
+                         + 0.7540*blk_pm - 0.8348*tov_pm)
+    assign(paste(position, "Data", sep = ""), tempdata[,c("player", "player_id",
+                                                          "minutes", "plus_minus_pm",
+                                                          "drb_pm", "ast_pm",
+                                                          "stl_pm", "blk_pm",
+                                                          "tov_pm", "mPM", "rPM")],
+           envir = .GlobalEnv)
+    #Use only the variates that are used in the model or to identify a player
+  }
+  if (position == "SF") {
+    tempdata$mPM <- with(tempdata, -0.19891 + 0.78939*drb_pm
+                         + 0.94115*ast_pm + 0.93194*stl_pm)
+    tempdata$rPM <- with(tempdata, -0.1963 + 0.7999*drb_pm
+                         + 0.8961*ast_pm + 0.9312*stl_pm)
+    assign(paste(position, "Data", sep = ""), tempdata[,c("player", "player_id",
+                                                          "minutes", "plus_minus_pm",
+                                                          "drb_pm", "ast_pm",
+                                                          "stl_pm", "mPM", "rPM")],
+           envir = .GlobalEnv)
+    #Use only the variates that are used in the model or to identify a player
+  }
+  if (position == "PF") {
+    tempdata$mPM <- with(tempdata, -0.17836 + 0.17864*ts_pm
+                         + 0.64112*drb_pm + 0.75426*blk_pm)
+    tempdata$rPM <- with(tempdata, -0.1731 + 0.1729*ts_pm
+                         + 0.6384*drb_pm + 0.7531*blk_pm)
+    assign(paste(position, "Data", sep = ""), tempdata[,c("player", "player_id",
+                                                          "minutes", "plus_minus_pm",
+                                                          "ts_pm", "drb_pm",
+                                                          "blk_pm", "mPM", "rPM")],
+           envir = .GlobalEnv)
+    #Use only the variates that are used in the model or to identify a player
+  }
+  if (position == "C") {
+    tempdata$mPM <- with(tempdata, -0.277898 + 0.713072*ts_pm
+                         + 0.916154*drb_pm + 0.762878*ast_pm
+                         + 1.416910*blk_pm - 0.015303*usg_pct)
+    tempdata$rPM <- with(tempdata, -0.2662 + 0.7243*ts_pm
+                         + 0.8733*drb_pm + 0.7276*ast_pm
+                         + 1.4514*blk_pm - 0.0153*usg_pct)
+    assign(paste(position, "Data", sep = ""), tempdata[,c("player", "player_id",
+                                                          "minutes", "plus_minus_pm",
+                                                          "ts_pm", "drb_pm",
+                                                          "ast_pm", "blk_pm",
+                                                          "usg_pct", "mPM", "rPM")],
+           envir = .GlobalEnv)
+    #Use only the variates that are used in the model or to identify a player
+  }
+}
+
+for (i in 1:5) { #apply function to all 5 positions
+  xPM(positions[i])
+}
+```
+
+Now that that those results have been compiled, let's take a look at how the estimated values of +/- compare to the actual ones observed from a general population standpoint for each position.
+
+```{r}
+vars <- c("plus_minus_pm", "mPM", "rPM")
+summary(PGData[,vars])
+summary(SGData[,vars])
+summary(SFData[,vars])
+summary(PFData[,vars])
+summary(CData[,vars])
+```
+
+The results obtained from this are promising, the first thing to note is that for all positions the minimum and maximum values are less extreme than the actual observed values. This makes sense due to the models moving every value closer towards the median which is going to be close to 0. The median for both models is very close to 0 for all positions, with the median for the robust regression model being slightly closer to 0 for every position except for point guards. This coupled with the smaller intervals of [Min, Max] for the robust regression model is why I'm going to continue using this model as it is less influenced by extreme performances one way or another and I want to get the best idea as to how good an individual player is as a whole and I don't want this to be heavily influenced by "fluke" performance whether they are good or bad. The next step is to compile a data frame that contains player's totals to see how players rank based on the model and get a good idea as to how effective it is:
+
+```{r}
+totPGdata <- ddply(PGData, .(player, player_id), summarise, position = "PG",
+                   games = length(minutes), mins = sum(minutes),
+                   plus_minus_pm = weighted.mean(plus_minus_pm, minutes),
+                   drb_pm = weighted.mean(drb_pm, minutes),
+                   ast_pm = weighted.mean(ast_pm, minutes),
+                   stl_pm = weighted.mean(stl_pm, minutes),
+                   tov_pm = weighted.mean(tov_pm, minutes),
+                   rPM_pm = weighted.mean(rPM, minutes))
+totPGdata$plus_minus <- with(totPGdata, plus_minus_pm * mins)
+totPGdata$rPM <- with(totPGdata, rPM_pm * mins)
+head(totPGdata[order(totPGdata$rPM, decreasing = TRUE),c(1,13)]) #view highest rPM PGs
+```
+
+From the highest rated point guards list, there are some immediate good signs, the first thing being that Lebron James and Luka Doncic are the top 2 players. I think that it'd be hard to find anyone who can make a solid argument as to why Lebron James wouldn't be first and Luka Doncic has also played amazingly well the last year and a half (which is the span of data being considered), so his name at second makes sense as well. The other players are all players that would be considered near the top of point guards in the league, one thing to keep in mind is that players who have been injured or have not played many minutes in the last year and a half won't be as highly ranked, so someone like Stephen Curry will be much lower than what people might rank him. There does also seem to be a pretty heavy emphasis on players who are strong defensively; with Chris Paul, Ricky Rubio, Ben Simmons and Dejounte Murray all being strong defenders. Some people might think that there is a bias that is too strongly defensively skewed, but maybe there is actually an undervaluing of defense at the point guard position currently. Let's take a look at the top players when considering all positions:
+
+```{r}
+#Shooting guards model data:
+totSGdata <- ddply(SGData, .(player, player_id), summarise, position = "SG",
+                   games = length(minutes), mins = sum(minutes),
+                   plus_minus_pm = weighted.mean(plus_minus_pm, minutes),
+                   drb_pm = weighted.mean(drb_pm, minutes),
+                   ast_pm = weighted.mean(ast_pm, minutes),
+                   stl_pm = weighted.mean(stl_pm, minutes),
+                   blk_pm = weighted.mean(blk_pm, minutes),
+                   tov_pm = weighted.mean(tov_pm, minutes),
+                   rPM_pm = weighted.mean(rPM, minutes))
+totSGdata$plus_minus <- with(totSGdata, plus_minus_pm * mins)
+totSGdata$rPM <- with(totSGdata, rPM_pm * mins)
+
+#Small forwards model data:
+totSFdata <- ddply(SFData, .(player, player_id), summarise, position = "SF",
+                   games = length(minutes), mins = sum(minutes),
+                   plus_minus_pm = weighted.mean(plus_minus_pm, minutes),
+                   drb_pm = weighted.mean(drb_pm, minutes),
+                   ast_pm = weighted.mean(ast_pm, minutes),
+                   stl_pm = weighted.mean(stl_pm, minutes),
+                   rPM_pm = weighted.mean(rPM, minutes))
+totSFdata$plus_minus <- with(totSFdata, plus_minus_pm * mins)
+totSFdata$rPM <- with(totSFdata, rPM_pm * mins)
+
+#Power forwards model data:
+totPFdata <- ddply(PFData, .(player, player_id), summarise, position = "PF",
+                   games = length(minutes), mins = sum(minutes),
+                   plus_minus_pm = weighted.mean(plus_minus_pm, minutes),
+                   ts_pm = weighted.mean(ts_pm, minutes),
+                   drb_pm = weighted.mean(drb_pm, minutes),
+                   blk_pm = weighted.mean(blk_pm, minutes),
+                   rPM_pm = weighted.mean(rPM, minutes))
+totPFdata$plus_minus <- with(totPFdata, plus_minus_pm * mins)
+totPFdata$rPM <- with(totPFdata, rPM_pm * mins)
+
+#Center model data:
+totCdata <- ddply(CData, .(player, player_id), summarise, position = "C",
+                  games = length(minutes), mins = sum(minutes),
+                  plus_minus_pm = weighted.mean(plus_minus_pm, minutes),
+                  ts_pm = weighted.mean(ts_pm, minutes),
+                  drb_pm = weighted.mean(drb_pm, minutes),
+                  ast_pm = weighted.mean(ast_pm, minutes),
+                  blk_pm = weighted.mean(blk_pm, minutes),
+                  usg_pct = weighted.mean(usg_pct, minutes),
+                  rPM_pm = weighted.mean(rPM, minutes))
+totCdata$plus_minus <- with(totCdata, plus_minus_pm * mins)
+totCdata$rPM <- with(totCdata, rPM_pm * mins)
+
+#Set up for the data frame with all of the players from all positions:
+totData <- rbind(totPGdata[,c(1:5, 12:13)], totSGdata[,c(1:5, 13:14)],
+                 totSFdata[,c(1:5, 11:12)], totPFdata[,c(1:5, 11:12)],
+                 totCdata[,c(1:5, 13:14)])
+head(totData[order(totData$rPM, decreasing = TRUE),c(1,7)]) #view highest rPM players
+```
+
+Every single one of these players, except for Hassan Whiteside would easily be able to have a conversation for being a top player in the NBA over the last year and a half. Why is Hassan Whiteside here then? Since he's a player who gets way more blocks than the average center almost every game, all of his games are outliers relative to the population of centers. This leads to his blocks being valued too highly and is the same reason some other players, who are very good in other categories like steals and blocks where players will average very low numbers, are valued higher than one might expect. So, I can conclude that this model isn't perfect, it has a general trend of placing players where they "should" be but has some issues with certain types of players. However, the point of this report was not only to see if I could find a way to rank players in the NBA by skill, but also to illustrate the importance of sample size. To do this I'm going to use the example of Lamelo Ball.
+
+Lamelo Ball is a rookie point guard for the Charlotte Hornets who has played 26 games this season. The first thing to note when talking about sample size's importance is that I'll be evaluating the player's value of rPM per minute. This will be my "skill" metric, it isn't too important how accurate it is but more so how much this value is changing with the number of games.
+
+To start, Lamelo Ball's rPM/min is 0.1220021043. This places him at 8th out of NBA point guards, but let's be a little bit more selective with who qualifies as ranked and say that we'll only consider players who have played at least 70 games in the last year and a half. That would place Lamelo at 5th in the NBA with his closest comparison in terms of skill being Ben Simmons who is 6th with an rPM/min of 0.1217612245. So does this mean that Lamelo Ball is the 5th best point guard in the NBA? No, it means that I have to dive a little bit deeper into the sampling errors.
+
+The first thing to note is that I'll have to use the residual standard error for the robust regression model used on point guards since that was the model used for the rPM/min values. The residual standard error is $\hat \sigma = 0.4293$. This standard error is set using individual games of data, so if I want to get the standard error for rPM/min when it is the average over all of the player's games, I have to use this equation $SE = \dfrac{\hat \sigma}{\sqrt{n}}$ where n is the number of games played by the player.
+
+Using the standard error and the number of games played by Lamelo Ball (26), I can make a 95% confidence interval with the following equation: $rPM/min \pm z\times\dfrac{\hat \sigma}{\sqrt{n}}$ where z is the z score of the normal distribution calculated with the following R code:
+
+```{r}
+alpha <- 0.05
+z <- qnorm(1-alpha/2)
+z
+```
+
+Putting all of these values together, Lamelo Ball's 95% confidence interval for his rPM/min is:
+$$rPM/min \pm z\times\dfrac{\hat \sigma}{\sqrt{n}}=0.1220021043\pm1.959964\times\dfrac{0.4293}{\sqrt{26}}=[-0.04301247, 0.2870167]$$
+
+Looking at where these values would place him; the minimum value of -0.04301247 would place him 37th out of all 41 qualified point guards (70 games or more) which is in between Austin Rivers and Dennis Schroder, while his maximum value of 0.2870167 would place him first with almost double Lebron James's rPM/min (0.153011523). So what does that mean? That means that his true skill is somewhere between the best point guard in the NBA handedly and the 37th best point guard in the league in 95% of attempts where this experiment is run. So, was anything achieved from this stat given Lamelo Ball has only played 26 games? No.
+
+So that brings up the question, at what point does a player's rPM/min become a valuable statistic at evaluating their skills. Well the first thing to look at would be what level of accuracy am I considering to be necessary to determine a player's skill? In this ranking of point guards most of the gaps between ranks tend to have a difference of roughly 0.01, so that is the interval size I will want for my confidence interval. That means that I need the z score times the standard error to be $\dfrac{0.01}{2}$. Plugging that in and solving for n I get:
+
+$$0.005 = z\times\dfrac{\hat \sigma}{\sqrt{n}} = 1.959964\times\dfrac{0.4293}{\sqrt{n}}$$
+$$n = (1.959964\times\dfrac{0.4293}{0.005})^2=283.19$$
+
+This means that after 284 games, you would be able to get an acceptably accurate ranking as to where a point guard was relative to the rest of the league. That is more than three full seasons of playing every game! Needless to say that many basketball fans come to conclusions far too quickly about how good or bad a player is.
